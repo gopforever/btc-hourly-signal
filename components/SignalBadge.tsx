@@ -1,0 +1,1 @@
+export function SignalBadge({signal}:{signal?:string|null}){const v=signal??"Neutral";let c="yellow";if(v.includes("Bullish"))c="green";if(v.includes("Bearish"))c="red";if(v==="Neutral")c="blue";return <span className={`badge ${c}`}>{v}</span>}
