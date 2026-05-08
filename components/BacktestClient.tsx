@@ -24,6 +24,7 @@ type Summary = {
 };
 
 type BacktestRow = {
+  model: "Current Model" | "Tuned Model V2";
   candle_ts: string;
   next_ts: string;
   signal: string;
@@ -48,6 +49,15 @@ type BacktestRow = {
   support?: number | null;
   resistance?: number | null;
   notes: string[];
+  v2Reasons?: string[];
+};
+
+type ModelResult = {
+  summary: Summary;
+  bySignal: Array<Summary & { signal: string }>;
+  thresholdComparison: Array<Summary & { threshold: number }>;
+  bestThreshold: (Summary & { threshold: number }) | null;
+  recent: BacktestRow[];
 };
 
 type BacktestPayload = {
@@ -60,11 +70,18 @@ type BacktestPayload = {
     candleCount: number;
     testedPeriods: number;
   };
-  summary: Summary;
-  bySignal: Array<Summary & { signal: string }>;
-  thresholdComparison: Array<Summary & { threshold: number }>;
-  bestThreshold: (Summary & { threshold: number }) | null;
-  recent: BacktestRow[];
+  current: ModelResult;
+  tunedV2: ModelResult;
+  comparison: {
+    tradeableSignalsDelta: number;
+    noTradeDelta: number;
+    usefulAccuracyDelta: number;
+    directionalAccuracyDelta: number;
+    avgDirectionalEdgeDelta: number;
+    strongLossDelta: number;
+    usefulWinDelta: number;
+    usefulLossDelta: number;
+  };
 };
 
 const money = (v?: number | null) =>
@@ -78,6 +95,9 @@ const money = (v?: number | null) =>
 
 const pct = (v?: number | null) =>
   v == null || Number.isNaN(v) ? "—" : `${v >= 0 ? "+" : ""}${v.toFixed(3)}%`;
+
+const signed = (v: number, suffix = "") =>
+  `${v >= 0 ? "+" : ""}${v}${suffix}`;
 
 const timeLabel = (iso: string) =>
   new Date(iso).toLocaleString([], {
@@ -101,6 +121,12 @@ function gradeClass(grade: string) {
   return "badge blue";
 }
 
+function deltaClass(value: number) {
+  if (value > 0) return "badge green";
+  if (value < 0) return "badge red";
+  return "badge blue";
+}
+
 function MetricCard({
   label,
   value,
@@ -119,29 +145,142 @@ function MetricCard({
   );
 }
 
-function SummaryGrid({ summary }: { summary: Summary }) {
+function SummaryGrid({ summary, title }: { summary: Summary; title: string }) {
   return (
-    <section className="grid grid-4" style={{ marginBottom: 16 }}>
-      <MetricCard
-        label="Tradeable Accuracy"
-        value={`${summary.directionalAccuracyPct}%`}
-        sub={`${summary.correct} correct / ${summary.tradeableSignals} tradeable`}
-      />
-      <MetricCard
-        label="Useful Accuracy"
-        value={`${summary.usefulAccuracyPct}%`}
-        sub={`${summary.usefulWins} wins / ${summary.usefulLosses} losses`}
-      />
-      <MetricCard
-        label="Avg Directional Edge"
-        value={pct(summary.avgDirectionalEdgePct)}
-        sub="Positive means model direction helped"
-      />
-      <MetricCard
-        label="No-Trade Filtered"
-        value={summary.noTradeSignals}
-        sub={`${summary.totalPeriods} total tested periods`}
-      />
+    <section style={{ marginBottom: 16 }}>
+      <div className="metric-title" style={{ margin: "0 0 10px 4px" }}>
+        {title}
+      </div>
+
+      <section className="grid grid-4">
+        <MetricCard
+          label="Tradeable Accuracy"
+          value={`${summary.directionalAccuracyPct}%`}
+          sub={`${summary.correct} correct / ${summary.tradeableSignals} tradeable`}
+        />
+        <MetricCard
+          label="Useful Accuracy"
+          value={`${summary.usefulAccuracyPct}%`}
+          sub={`${summary.usefulWins} wins / ${summary.usefulLosses} losses`}
+        />
+        <MetricCard
+          label="Avg Directional Edge"
+          value={pct(summary.avgDirectionalEdgePct)}
+          sub="Positive means model direction helped"
+        />
+        <MetricCard
+          label="No-Trade Filtered"
+          value={summary.noTradeSignals}
+          sub={`${summary.totalPeriods} total tested periods`}
+        />
+      </section>
+    </section>
+  );
+}
+
+function ThresholdTable({
+  title,
+  rows
+}: {
+  title: string;
+  rows: ModelResult["thresholdComparison"];
+}) {
+  return (
+    <div className="card card-inner">
+      <div className="metric-title" style={{ marginBottom: 10 }}>
+        {title}
+      </div>
+
+      <table className="table">
+        <thead>
+          <tr>
+            <th>Threshold</th>
+            <th>Tradeable</th>
+            <th>No Trade</th>
+            <th>Accuracy</th>
+            <th>Useful</th>
+            <th>Avg Edge</th>
+            <th>Strong Loss</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => (
+            <tr key={row.threshold}>
+              <td>{row.threshold}%</td>
+              <td>{row.tradeableSignals}</td>
+              <td>{row.noTradeSignals}</td>
+              <td>{row.directionalAccuracyPct}%</td>
+              <td>{row.usefulAccuracyPct}%</td>
+              <td>{pct(row.avgDirectionalEdgePct)}</td>
+              <td>{row.strongLosses}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function RecentTable({
+  title,
+  rows,
+  showReasons
+}: {
+  title: string;
+  rows: BacktestRow[];
+  showReasons?: boolean;
+}) {
+  return (
+    <section className="card card-inner" style={{ marginTop: 16 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 16, marginBottom: 12 }}>
+        <div>
+          <div className="metric-title">{title}</div>
+          <div className="metric-value">Last {rows.length}</div>
+        </div>
+      </div>
+
+      <table className="table">
+        <thead>
+          <tr>
+            <th>Hour</th>
+            <th>Raw Signal</th>
+            <th>Effective</th>
+            <th>Conf</th>
+            <th>Close</th>
+            <th>Next</th>
+            <th>Move</th>
+            <th>Edge</th>
+            <th>Grade</th>
+            {showReasons ? <th>V2 Reason</th> : null}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.slice(0, 60).map((row) => (
+            <tr key={`${row.model}-${row.candle_ts}-${row.next_ts}`}>
+              <td>{timeLabel(row.candle_ts)}</td>
+              <td>
+                <span className={signalClass(row.signal)}>{row.signal}</span>
+              </td>
+              <td>
+                <span className={signalClass(row.effectiveSignal)}>{row.effectiveSignal}</span>
+              </td>
+              <td>{row.confidence}%</td>
+              <td>{money(row.close)}</td>
+              <td>{money(row.next_close)}</td>
+              <td>{pct(row.movePct)}</td>
+              <td>{pct(row.directionalScorePct)}</td>
+              <td>
+                <span className={gradeClass(row.grade)}>{row.grade}</span>
+              </td>
+              {showReasons ? (
+                <td className="subtle">
+                  {(row.v2Reasons ?? []).slice(0, 2).join(" ")}
+                </td>
+              ) : null}
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </section>
   );
 }
@@ -192,13 +331,18 @@ export function BacktestClient() {
   }, []);
 
   const recommendation = useMemo(() => {
-    if (!data?.bestThreshold) return "Collect more resolved candles before tuning.";
+    if (!data?.tunedV2.bestThreshold) return "Collect more resolved candles before tuning.";
 
-    const best = data.bestThreshold;
+    const currentBest = data.current.bestThreshold;
+    const tunedBest = data.tunedV2.bestThreshold;
 
-    return `Best tested threshold: ${best.threshold}% confidence. Useful accuracy ${best.usefulAccuracyPct}%, average edge ${pct(
-      best.avgDirectionalEdgePct
-    )}, tradeable signals ${best.tradeableSignals}.`;
+    const currentText = currentBest
+      ? `Current best: ${currentBest.threshold}% confidence, useful ${currentBest.usefulAccuracyPct}%, edge ${pct(currentBest.avgDirectionalEdgePct)}.`
+      : "Current best unavailable.";
+
+    return `${currentText} V2 best: ${tunedBest.threshold}% confidence, useful ${tunedBest.usefulAccuracyPct}%, edge ${pct(
+      tunedBest.avgDirectionalEdgePct
+    )}, tradeable ${tunedBest.tradeableSignals}.`;
   }, [data]);
 
   return (
@@ -208,8 +352,8 @@ export function BacktestClient() {
           <div className="subtle">Historical Simulation</div>
           <h1 className="h1">Backtest + Tuning Dashboard</h1>
           <p className="subtle">
-            Simulates the current signal engine over stored BTC hourly candles, then compares confidence thresholds
-            so we can tune for fewer but higher-quality signals.
+            Compares the current hourly BTC signal engine against Tuned Model V2. V2 uses stricter trend,
+            momentum, volatility, overextension, and no-trade filters.
           </p>
 
           <div
@@ -287,7 +431,7 @@ export function BacktestClient() {
         <div className="card card-inner">
           <div className="metric-title">Recommendation</div>
           <div className="metric-value" style={{ fontSize: 22 }}>
-            Tune by confidence
+            Compare V2 before live use
           </div>
           <p className="subtle">{recommendation}</p>
         </div>
@@ -303,7 +447,31 @@ export function BacktestClient() {
         <section className="card card-inner">Loading backtest data...</section>
       ) : (
         <>
-          <SummaryGrid summary={data.summary} />
+          <section className="grid grid-4" style={{ marginBottom: 16 }}>
+            <MetricCard
+              label="Useful Accuracy Delta"
+              value={signed(data.comparison.usefulAccuracyDelta, "%")}
+              sub="V2 minus Current"
+            />
+            <MetricCard
+              label="Avg Edge Delta"
+              value={pct(data.comparison.avgDirectionalEdgeDelta)}
+              sub="V2 minus Current"
+            />
+            <MetricCard
+              label="Strong Loss Delta"
+              value={signed(data.comparison.strongLossDelta)}
+              sub="Lower is better"
+            />
+            <MetricCard
+              label="No-Trade Delta"
+              value={signed(data.comparison.noTradeDelta)}
+              sub="Higher means stricter filtering"
+            />
+          </section>
+
+          <SummaryGrid summary={data.current.summary} title="Current Model" />
+          <SummaryGrid summary={data.tunedV2.summary} title="Tuned Model V2" />
 
           <section className="grid grid-4" style={{ marginBottom: 16 }}>
             <MetricCard
@@ -312,57 +480,37 @@ export function BacktestClient() {
               sub={`${data.config.testedPeriods} backtested signal periods`}
             />
             <MetricCard
-              label="Strong Wins"
-              value={data.summary.strongWins}
-              sub={`${data.summary.smallWins} small wins`}
+              label="Current Strong Losses"
+              value={data.current.summary.strongLosses}
+              sub={`${data.current.summary.smallLosses} small losses`}
             />
             <MetricCard
-              label="Strong Losses"
-              value={data.summary.strongLosses}
-              sub={`${data.summary.smallLosses} small losses`}
+              label="V2 Strong Losses"
+              value={data.tunedV2.summary.strongLosses}
+              sub={`${data.tunedV2.summary.smallLosses} small losses`}
             />
             <MetricCard
-              label="Flat / Noise"
-              value={data.summary.flat}
+              label="V2 Flat / Noise"
+              value={data.tunedV2.summary.flat}
               sub={`Move under ±${data.config.minUsefulMovePct}%`}
+            />
+          </section>
+
+          <section className="grid grid-2" style={{ marginBottom: 16 }}>
+            <ThresholdTable
+              title="Current Model Threshold Comparison"
+              rows={data.current.thresholdComparison}
+            />
+            <ThresholdTable
+              title="Tuned Model V2 Threshold Comparison"
+              rows={data.tunedV2.thresholdComparison}
             />
           </section>
 
           <section className="grid grid-2" style={{ marginBottom: 16 }}>
             <div className="card card-inner">
               <div className="metric-title" style={{ marginBottom: 10 }}>
-                Confidence Threshold Comparison
-              </div>
-
-              <table className="table">
-                <thead>
-                  <tr>
-                    <th>Threshold</th>
-                    <th>Tradeable</th>
-                    <th>No Trade</th>
-                    <th>Accuracy</th>
-                    <th>Useful</th>
-                    <th>Avg Edge</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {data.thresholdComparison.map((row) => (
-                    <tr key={row.threshold}>
-                      <td>{row.threshold}%</td>
-                      <td>{row.tradeableSignals}</td>
-                      <td>{row.noTradeSignals}</td>
-                      <td>{row.directionalAccuracyPct}%</td>
-                      <td>{row.usefulAccuracyPct}%</td>
-                      <td>{pct(row.avgDirectionalEdgePct)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-
-            <div className="card card-inner">
-              <div className="metric-title" style={{ marginBottom: 10 }}>
-                Accuracy by Raw Signal Type
+                Current Accuracy by Raw Signal Type
               </div>
 
               <table className="table">
@@ -376,7 +524,36 @@ export function BacktestClient() {
                   </tr>
                 </thead>
                 <tbody>
-                  {data.bySignal.map((row) => (
+                  {data.current.bySignal.map((row) => (
+                    <tr key={row.signal}>
+                      <td>{row.signal}</td>
+                      <td>{row.tradeableSignals}</td>
+                      <td>{row.directionalAccuracyPct}%</td>
+                      <td>{row.usefulAccuracyPct}%</td>
+                      <td>{pct(row.avgDirectionalEdgePct)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="card card-inner">
+              <div className="metric-title" style={{ marginBottom: 10 }}>
+                V2 Accuracy by Raw Signal Type
+              </div>
+
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th>Signal</th>
+                    <th>Tradeable</th>
+                    <th>Accuracy</th>
+                    <th>Useful</th>
+                    <th>Avg Edge</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.tunedV2.bySignal.map((row) => (
                     <tr key={row.signal}>
                       <td>{row.signal}</td>
                       <td>{row.tradeableSignals}</td>
@@ -390,56 +567,21 @@ export function BacktestClient() {
             </div>
           </section>
 
-          <section className="card card-inner">
-            <div style={{ display: "flex", justifyContent: "space-between", gap: 16, marginBottom: 12 }}>
-              <div>
-                <div className="metric-title">Recent Backtested Signals</div>
-                <div className="metric-value">Last {data.recent.length}</div>
-              </div>
-            </div>
+          <RecentTable
+            title="Recent Tuned Model V2 Backtested Signals"
+            rows={data.tunedV2.recent}
+            showReasons
+          />
 
-            <table className="table">
-              <thead>
-                <tr>
-                  <th>Hour</th>
-                  <th>Raw Signal</th>
-                  <th>Effective</th>
-                  <th>Conf</th>
-                  <th>Close</th>
-                  <th>Next</th>
-                  <th>Move</th>
-                  <th>Edge</th>
-                  <th>Grade</th>
-                </tr>
-              </thead>
-              <tbody>
-                {data.recent.slice(0, 60).map((row) => (
-                  <tr key={`${row.candle_ts}-${row.next_ts}`}>
-                    <td>{timeLabel(row.candle_ts)}</td>
-                    <td>
-                      <span className={signalClass(row.signal)}>{row.signal}</span>
-                    </td>
-                    <td>
-                      <span className={signalClass(row.effectiveSignal)}>{row.effectiveSignal}</span>
-                    </td>
-                    <td>{row.confidence}%</td>
-                    <td>{money(row.close)}</td>
-                    <td>{money(row.next_close)}</td>
-                    <td>{pct(row.movePct)}</td>
-                    <td>{pct(row.directionalScorePct)}</td>
-                    <td>
-                      <span className={gradeClass(row.grade)}>{row.grade}</span>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+          <RecentTable
+            title="Recent Current Model Backtested Signals"
+            rows={data.current.recent}
+          />
 
-            <div className="footer-note">
-              Backtest is historical simulation using your stored hourly candles. It is not proof of future performance.
-              The goal is to identify thresholds that reduce bad signals and increase positive directional edge.
-            </div>
-          </section>
+          <div className="footer-note">
+            V2 is backtest-only right now. Do not wire it into the live signal engine until it shows a durable
+            improvement over more candles.
+          </div>
         </>
       )}
     </>

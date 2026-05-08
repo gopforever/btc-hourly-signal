@@ -11,7 +11,10 @@ type BacktestGrade =
   | "Strong Loss"
   | "No Trade";
 
+type ModelName = "Current Model" | "Tuned Model V2";
+
 type BacktestRow = {
+  model: ModelName;
   candle_ts: string;
   next_ts: string;
   signal: Signal["signal"];
@@ -36,6 +39,7 @@ type BacktestRow = {
   support?: number | null;
   resistance?: number | null;
   notes: string[];
+  v2Reasons?: string[];
 };
 
 type Summary = {
@@ -58,6 +62,11 @@ type Summary = {
   avgLossPct: number;
 };
 
+type TunedSignal = Signal & {
+  effectiveSignal: Signal["signal"] | "No Trade";
+  v2Reasons: string[];
+};
+
 const round = (value: number, digits = 3) =>
   Number.isFinite(value) ? Number(value.toFixed(digits)) : 0;
 
@@ -74,14 +83,130 @@ function applyTradeFilter(signal: Signal, minConfidence: number) {
   return signal.signal;
 }
 
+function applyTunedModelV2(signal: Signal, candles: Candle[], minConfidence: number): TunedSignal {
+  const reasons: string[] = [];
+
+  const rsi = signal.rsi ?? 50;
+  const ema9 = signal.ema_9 ?? signal.close;
+  const ema21 = signal.ema_21 ?? signal.close;
+  const ema50 = signal.ema_50 ?? signal.close;
+  const macdHist = signal.macd_histogram ?? 0;
+  const close = signal.close;
+  const atr = signal.atr ?? 0;
+
+  const emaSpreadPct = close ? (Math.abs(ema9 - ema21) / close) * 100 : 0;
+  const emaTrendSpreadPct = close ? (Math.abs(ema21 - ema50) / close) * 100 : 0;
+  const atrPct = close ? (atr / close) * 100 : 0;
+
+  const recent = candles.slice(-8);
+  const recentRange =
+    recent.length > 0
+      ? Math.max(...recent.map((c) => c.high)) - Math.min(...recent.map((c) => c.low))
+      : 0;
+  const recentRangePct = close ? (recentRange / close) * 100 : 0;
+
+  let effectiveSignal: Signal["signal"] | "No Trade" = applyTradeFilter(signal, minConfidence);
+
+  if (effectiveSignal === "No Trade") {
+    reasons.push(`Below confidence threshold or neutral raw signal.`);
+    return { ...signal, effectiveSignal, v2Reasons: reasons };
+  }
+
+  if (emaSpreadPct < 0.08) {
+    effectiveSignal = "No Trade";
+    reasons.push(`EMA 9/21 spread is too tight (${round(emaSpreadPct)}%), indicating chop.`);
+  }
+
+  if (emaTrendSpreadPct < 0.10) {
+    effectiveSignal = "No Trade";
+    reasons.push(`EMA 21/50 spread is too tight (${round(emaTrendSpreadPct)}%), weak trend structure.`);
+  }
+
+  if (atrPct < 0.18) {
+    effectiveSignal = "No Trade";
+    reasons.push(`ATR is low (${round(atrPct)}%), reducing hourly movement potential.`);
+  }
+
+  if (recentRangePct < 0.35) {
+    effectiveSignal = "No Trade";
+    reasons.push(`Recent 8-hour range is compressed (${round(recentRangePct)}%), likely sideways action.`);
+  }
+
+  if (effectiveSignal.includes("Bullish")) {
+    const bullishAgreement =
+      close > ema9 &&
+      ema9 > ema21 &&
+      ema21 >= ema50 * 0.995 &&
+      macdHist > 0 &&
+      rsi >= 48 &&
+      rsi <= 72;
+
+    if (!bullishAgreement) {
+      effectiveSignal = "No Trade";
+      reasons.push(`Bullish setup failed V2 agreement filter.`);
+    }
+
+    if (rsi > 72) {
+      effectiveSignal = "No Trade";
+      reasons.push(`RSI is overextended above 72; avoiding bullish chase.`);
+    }
+  }
+
+  if (effectiveSignal.includes("Bearish")) {
+    const bearishAgreement =
+      close < ema9 &&
+      ema9 < ema21 &&
+      ema21 <= ema50 * 1.005 &&
+      macdHist <= 0 &&
+      rsi <= 52 &&
+      rsi >= 28;
+
+    const weakBearishMomentum =
+      close < ema9 &&
+      ema9 < ema21 &&
+      rsi <= 48 &&
+      macdHist < 8;
+
+    if (!bearishAgreement && !weakBearishMomentum) {
+      effectiveSignal = "No Trade";
+      reasons.push(`Bearish setup failed V2 agreement filter.`);
+    }
+
+    if (rsi < 28) {
+      effectiveSignal = "No Trade";
+      reasons.push(`RSI is oversold below 28; avoiding bearish chase.`);
+    }
+  }
+
+  if (effectiveSignal !== "No Trade" && signal.confidence < 75) {
+    effectiveSignal = "No Trade";
+    reasons.push(`V2 requires at least 75% confidence for tradeable signals.`);
+  }
+
+  if (effectiveSignal !== "No Trade") {
+    reasons.push(`V2 accepted: trend, momentum, volatility, and confidence filters passed.`);
+  }
+
+  return {
+    ...signal,
+    effectiveSignal,
+    v2Reasons: reasons
+  };
+}
+
 function gradeBacktestSignal(
+  model: ModelName,
   signal: Signal,
   next: Candle,
   minConfidence: number,
   minUsefulMovePct: number,
-  strongMovePct: number
+  strongMovePct: number,
+  effectiveOverride?: Signal["signal"] | "No Trade",
+  v2Reasons?: string[]
 ): BacktestRow {
-  const effectiveSignal = applyTradeFilter(signal, minConfidence);
+  const effectiveSignal =
+    effectiveOverride ?? applyTradeFilter(signal, minConfidence);
+
   const move = next.close - signal.close;
   const movePct = signal.close === 0 ? 0 : (move / signal.close) * 100;
 
@@ -89,6 +214,7 @@ function gradeBacktestSignal(
 
   if (!isTradeable) {
     return {
+      model,
       candle_ts: signal.candle_ts,
       next_ts: next.ts,
       signal: signal.signal,
@@ -112,7 +238,8 @@ function gradeBacktestSignal(
       macd_histogram: signal.macd_histogram,
       support: signal.support,
       resistance: signal.resistance,
-      notes: signal.notes ?? []
+      notes: signal.notes ?? [],
+      v2Reasons
     };
   }
 
@@ -125,7 +252,10 @@ function gradeBacktestSignal(
   } else if (direction === "down") {
     directionalScorePct = -movePct;
   } else {
-    directionalScorePct = Math.abs(movePct) <= minUsefulMovePct ? minUsefulMovePct : -Math.abs(movePct);
+    directionalScorePct =
+      Math.abs(movePct) <= minUsefulMovePct
+        ? minUsefulMovePct
+        : -Math.abs(movePct);
   }
 
   let grade: BacktestGrade = "Flat";
@@ -136,11 +266,13 @@ function gradeBacktestSignal(
   else if (directionalScorePct > -strongMovePct) grade = "Small Loss";
   else grade = "Strong Loss";
 
-  const isCorrect = grade === "Strong Win" || grade === "Small Win" || grade === "Flat";
+  const isCorrect =
+    grade === "Strong Win" || grade === "Small Win" || grade === "Flat";
   const isUsefulWin = grade === "Strong Win" || grade === "Small Win";
   const isUsefulLoss = grade === "Strong Loss" || grade === "Small Loss";
 
   return {
+    model,
     candle_ts: signal.candle_ts,
     next_ts: next.ts,
     signal: signal.signal,
@@ -164,7 +296,8 @@ function gradeBacktestSignal(
     macd_histogram: signal.macd_histogram,
     support: signal.support,
     resistance: signal.resistance,
-    notes: signal.notes ?? []
+    notes: signal.notes ?? [],
+    v2Reasons
   };
 }
 
@@ -211,7 +344,13 @@ function summarize(rows: BacktestRow[]): Summary {
 }
 
 function bySignal(rows: BacktestRow[]) {
-  const labels = ["Strong Bullish", "Bullish", "Bearish", "Strong Bearish", "Neutral"];
+  const labels = [
+    "Strong Bullish",
+    "Bullish",
+    "Bearish",
+    "Strong Bearish",
+    "Neutral"
+  ];
 
   return labels.map((signal) => {
     const group = rows.filter((r) => r.signal === signal);
@@ -223,16 +362,39 @@ function bySignal(rows: BacktestRow[]) {
 }
 
 function thresholdComparison(
-  signals: Array<{ signal: Signal; next: Candle }>,
+  signals: Array<{ signal: Signal; next: Candle; history: Candle[] }>,
   minUsefulMovePct: number,
-  strongMovePct: number
+  strongMovePct: number,
+  model: ModelName
 ) {
-  const thresholds = [50, 55, 60, 65, 70, 75, 80, 85];
+  const thresholds = [50, 55, 60, 65, 70, 75, 80, 85, 90];
 
   return thresholds.map((threshold) => {
-    const rows = signals.map(({ signal, next }) =>
-      gradeBacktestSignal(signal, next, threshold, minUsefulMovePct, strongMovePct)
-    );
+    const rows = signals.map(({ signal, next, history }) => {
+      if (model === "Tuned Model V2") {
+        const tuned = applyTunedModelV2(signal, history, threshold);
+
+        return gradeBacktestSignal(
+          model,
+          signal,
+          next,
+          threshold,
+          minUsefulMovePct,
+          strongMovePct,
+          tuned.effectiveSignal,
+          tuned.v2Reasons
+        );
+      }
+
+      return gradeBacktestSignal(
+        model,
+        signal,
+        next,
+        threshold,
+        minUsefulMovePct,
+        strongMovePct
+      );
+    });
 
     return {
       threshold,
@@ -241,10 +403,8 @@ function thresholdComparison(
   });
 }
 
-function pickBestThreshold(
-  rows: ReturnType<typeof thresholdComparison>
-) {
-  const candidates = rows.filter((r) => r.tradeableSignals >= 10);
+function pickBestThreshold(rows: ReturnType<typeof thresholdComparison>) {
+  const candidates = rows.filter((r) => r.tradeableSignals >= 8);
 
   if (!candidates.length) {
     return rows[0] ?? null;
@@ -261,8 +421,28 @@ function pickBestThreshold(
         return b.avgDirectionalEdgePct - a.avgDirectionalEdgePct;
       }
 
+      if (a.strongLosses !== b.strongLosses) {
+        return a.strongLosses - b.strongLosses;
+      }
+
       return b.tradeableSignals - a.tradeableSignals;
     })[0];
+}
+
+function improvement(current: Summary, tuned: Summary) {
+  return {
+    tradeableSignalsDelta: tuned.tradeableSignals - current.tradeableSignals,
+    noTradeDelta: tuned.noTradeSignals - current.noTradeSignals,
+    usefulAccuracyDelta: tuned.usefulAccuracyPct - current.usefulAccuracyPct,
+    directionalAccuracyDelta:
+      tuned.directionalAccuracyPct - current.directionalAccuracyPct,
+    avgDirectionalEdgeDelta: round(
+      tuned.avgDirectionalEdgePct - current.avgDirectionalEdgePct
+    ),
+    strongLossDelta: tuned.strongLosses - current.strongLosses,
+    usefulWinDelta: tuned.usefulWins - current.usefulWins,
+    usefulLossDelta: tuned.usefulLosses - current.usefulLosses
+  };
 }
 
 export async function GET(req: NextRequest) {
@@ -286,7 +466,10 @@ export async function GET(req: NextRequest) {
     const safeLimit = Math.min(Math.max(limit, 80), 2000);
     const safeMinConfidence = Math.min(Math.max(minConfidence, 0), 100);
     const safeMinUsefulMovePct = Math.min(Math.max(minUsefulMovePct, 0.01), 5);
-    const safeStrongMovePct = Math.min(Math.max(strongMovePct, safeMinUsefulMovePct), 10);
+    const safeStrongMovePct = Math.min(
+      Math.max(strongMovePct, safeMinUsefulMovePct),
+      10
+    );
 
     const { data, error } = await supabase
       .from("btc_hourly_candles")
@@ -311,13 +494,18 @@ export async function GET(req: NextRequest) {
       .reverse();
 
     if (candles.length < 80) {
-      return NextResponse.json({
-        error: "Not enough candles for backtesting. Run hourly ingest until you have at least 80 candles.",
-        candleCount: candles.length
-      }, { status: 400 });
+      return NextResponse.json(
+        {
+          error:
+            "Not enough candles for backtesting. Run hourly ingest until you have at least 80 candles.",
+          candleCount: candles.length
+        },
+        { status: 400 }
+      );
     }
 
-    const signalPairs: Array<{ signal: Signal; next: Candle }> = [];
+    const signalPairs: Array<{ signal: Signal; next: Candle; history: Candle[] }> =
+      [];
 
     for (let i = 50; i < candles.length - 1; i++) {
       const start = Math.max(0, i - 239);
@@ -326,12 +514,13 @@ export async function GET(req: NextRequest) {
       const next = candles[i + 1];
 
       if (signal) {
-        signalPairs.push({ signal, next });
+        signalPairs.push({ signal, next, history });
       }
     }
 
-    const rows = signalPairs.map(({ signal, next }) =>
+    const currentRows = signalPairs.map(({ signal, next }) =>
       gradeBacktestSignal(
+        "Current Model",
         signal,
         next,
         safeMinConfidence,
@@ -340,13 +529,40 @@ export async function GET(req: NextRequest) {
       )
     );
 
-    const thresholdRows = thresholdComparison(
+    const tunedRows = signalPairs.map(({ signal, next, history }) => {
+      const tuned = applyTunedModelV2(signal, history, safeMinConfidence);
+
+      return gradeBacktestSignal(
+        "Tuned Model V2",
+        signal,
+        next,
+        safeMinConfidence,
+        safeMinUsefulMovePct,
+        safeStrongMovePct,
+        tuned.effectiveSignal,
+        tuned.v2Reasons
+      );
+    });
+
+    const currentSummary = summarize(currentRows);
+    const tunedSummary = summarize(tunedRows);
+
+    const currentThresholdRows = thresholdComparison(
       signalPairs,
       safeMinUsefulMovePct,
-      safeStrongMovePct
+      safeStrongMovePct,
+      "Current Model"
     );
 
-    const bestThreshold = pickBestThreshold(thresholdRows);
+    const tunedThresholdRows = thresholdComparison(
+      signalPairs,
+      safeMinUsefulMovePct,
+      safeStrongMovePct,
+      "Tuned Model V2"
+    );
+
+    const currentBestThreshold = pickBestThreshold(currentThresholdRows);
+    const tunedBestThreshold = pickBestThreshold(tunedThresholdRows);
 
     return NextResponse.json({
       generatedAt: new Date().toISOString(),
@@ -356,13 +572,23 @@ export async function GET(req: NextRequest) {
         minUsefulMovePct: safeMinUsefulMovePct,
         strongMovePct: safeStrongMovePct,
         candleCount: candles.length,
-        testedPeriods: rows.length
+        testedPeriods: currentRows.length
       },
-      summary: summarize(rows),
-      bySignal: bySignal(rows),
-      thresholdComparison: thresholdRows,
-      bestThreshold,
-      recent: rows.slice().reverse().slice(0, 100)
+      current: {
+        summary: currentSummary,
+        bySignal: bySignal(currentRows),
+        thresholdComparison: currentThresholdRows,
+        bestThreshold: currentBestThreshold,
+        recent: currentRows.slice().reverse().slice(0, 100)
+      },
+      tunedV2: {
+        summary: tunedSummary,
+        bySignal: bySignal(tunedRows),
+        thresholdComparison: tunedThresholdRows,
+        bestThreshold: tunedBestThreshold,
+        recent: tunedRows.slice().reverse().slice(0, 100)
+      },
+      comparison: improvement(currentSummary, tunedSummary)
     });
   } catch (e) {
     return NextResponse.json(
