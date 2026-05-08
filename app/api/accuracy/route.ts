@@ -194,8 +194,15 @@ export async function GET() {
   try {
     const supabase = getSupabaseAdmin();
 
-    const { data, error } = await supabase
-      .from("btc_hourly_signals")
+if (!supabase) {
+  return NextResponse.json(
+    { error: "Supabase admin client is not configured." },
+    { status: 500 }
+  );
+}
+
+const { data, error } = await supabase
+  .from("btc_hourly_signals")
       .select(
         `
         id,
