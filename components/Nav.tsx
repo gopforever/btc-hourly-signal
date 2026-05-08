@@ -12,6 +12,7 @@ export function Nav() {
         <Link href="/">Dashboard</Link>
         <Link href="/accuracy">Accuracy</Link>
         <Link href="/backtest">Backtest</Link>
+        <Link href="/v3-shadow">V3 Shadow</Link>
         <a href="/api/dashboard" target="_blank">
           API
         </a>

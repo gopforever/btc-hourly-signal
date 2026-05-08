@@ -11,7 +11,7 @@ type BacktestGrade =
   | "Strong Loss"
   | "No Trade";
 
-type ModelName = "Current Model" | "Tuned Model V2";
+type ModelName = "Current Model" | "Tuned Model V2" | "Optimizer V3";
 
 type BacktestRow = {
   model: ModelName;
@@ -39,7 +39,7 @@ type BacktestRow = {
   support?: number | null;
   resistance?: number | null;
   notes: string[];
-  v2Reasons?: string[];
+  filterReasons?: string[];
 };
 
 type Summary = {
@@ -62,9 +62,28 @@ type Summary = {
   avgLossPct: number;
 };
 
-type TunedSignal = Signal & {
+type FilteredSignal = Signal & {
   effectiveSignal: Signal["signal"] | "No Trade";
-  v2Reasons: string[];
+  filterReasons: string[];
+};
+
+type V3Config = {
+  id: string;
+  minConfidence: number;
+  emaSpreadMinPct: number;
+  emaTrendSpreadMinPct: number;
+  atrMinPct: number;
+  rangeMinPct: number;
+  bullishRsiMin: number;
+  bearishRsiMax: number;
+  macdMode: "loose" | "medium" | "strict";
+};
+
+type OptimizerResult = {
+  rank: number;
+  score: number;
+  config: V3Config;
+  summary: Summary;
 };
 
 const round = (value: number, digits = 3) =>
@@ -83,9 +102,7 @@ function applyTradeFilter(signal: Signal, minConfidence: number) {
   return signal.signal;
 }
 
-function applyTunedModelV2(signal: Signal, candles: Candle[], minConfidence: number): TunedSignal {
-  const reasons: string[] = [];
-
+function getStats(signal: Signal, candles: Candle[]) {
   const rsi = signal.rsi ?? 50;
   const ema9 = signal.ema_9 ?? signal.close;
   const ema21 = signal.ema_21 ?? signal.close;
@@ -103,95 +120,209 @@ function applyTunedModelV2(signal: Signal, candles: Candle[], minConfidence: num
     recent.length > 0
       ? Math.max(...recent.map((c) => c.high)) - Math.min(...recent.map((c) => c.low))
       : 0;
+
   const recentRangePct = close ? (recentRange / close) * 100 : 0;
+
+  return {
+    rsi,
+    ema9,
+    ema21,
+    ema50,
+    macdHist,
+    close,
+    atr,
+    emaSpreadPct,
+    emaTrendSpreadPct,
+    atrPct,
+    recentRangePct
+  };
+}
+
+function applyTunedModelV2(signal: Signal, candles: Candle[], minConfidence: number): FilteredSignal {
+  const reasons: string[] = [];
+  const stats = getStats(signal, candles);
 
   let effectiveSignal: Signal["signal"] | "No Trade" = applyTradeFilter(signal, minConfidence);
 
   if (effectiveSignal === "No Trade") {
-    reasons.push(`Below confidence threshold or neutral raw signal.`);
-    return { ...signal, effectiveSignal, v2Reasons: reasons };
+    reasons.push("Below confidence threshold or neutral raw signal.");
+    return { ...signal, effectiveSignal, filterReasons: reasons };
   }
 
-  if (emaSpreadPct < 0.08) {
+  if (stats.emaSpreadPct < 0.04) {
     effectiveSignal = "No Trade";
-    reasons.push(`EMA 9/21 spread is too tight (${round(emaSpreadPct)}%), indicating chop.`);
+    reasons.push(`EMA 9/21 spread too tight: ${round(stats.emaSpreadPct)}%.`);
   }
 
-  if (emaTrendSpreadPct < 0.10) {
+  if (stats.emaTrendSpreadPct < 0.05) {
     effectiveSignal = "No Trade";
-    reasons.push(`EMA 21/50 spread is too tight (${round(emaTrendSpreadPct)}%), weak trend structure.`);
+    reasons.push(`EMA 21/50 spread too tight: ${round(stats.emaTrendSpreadPct)}%.`);
   }
 
-  if (atrPct < 0.18) {
+  if (stats.atrPct < 0.1) {
     effectiveSignal = "No Trade";
-    reasons.push(`ATR is low (${round(atrPct)}%), reducing hourly movement potential.`);
+    reasons.push(`ATR too low: ${round(stats.atrPct)}%.`);
   }
 
-  if (recentRangePct < 0.35) {
+  if (stats.recentRangePct < 0.25) {
     effectiveSignal = "No Trade";
-    reasons.push(`Recent 8-hour range is compressed (${round(recentRangePct)}%), likely sideways action.`);
+    reasons.push(`Recent range compressed: ${round(stats.recentRangePct)}%.`);
   }
 
   if (effectiveSignal.includes("Bullish")) {
     const bullishAgreement =
-      close > ema9 &&
-      ema9 > ema21 &&
-      ema21 >= ema50 * 0.995 &&
-      macdHist > 0 &&
-      rsi >= 48 &&
-      rsi <= 72;
+      stats.close > stats.ema9 &&
+      stats.ema9 > stats.ema21 &&
+      stats.ema21 >= stats.ema50 * 0.995 &&
+      stats.macdHist > 0 &&
+      stats.rsi >= 48 &&
+      stats.rsi <= 72;
 
     if (!bullishAgreement) {
       effectiveSignal = "No Trade";
-      reasons.push(`Bullish setup failed V2 agreement filter.`);
+      reasons.push("Bullish setup failed V2 agreement filter.");
     }
 
-    if (rsi > 72) {
+    if (stats.rsi > 72) {
       effectiveSignal = "No Trade";
-      reasons.push(`RSI is overextended above 72; avoiding bullish chase.`);
+      reasons.push("RSI overextended above 72.");
     }
   }
 
   if (effectiveSignal.includes("Bearish")) {
     const bearishAgreement =
-      close < ema9 &&
-      ema9 < ema21 &&
-      ema21 <= ema50 * 1.005 &&
-      macdHist <= 0 &&
-      rsi <= 52 &&
-      rsi >= 28;
+      stats.close < stats.ema9 &&
+      stats.ema9 < stats.ema21 &&
+      stats.ema21 <= stats.ema50 * 1.005 &&
+      stats.macdHist <= 0 &&
+      stats.rsi <= 52 &&
+      stats.rsi >= 28;
 
     const weakBearishMomentum =
-      close < ema9 &&
-      ema9 < ema21 &&
-      rsi <= 48 &&
-      macdHist < 8;
+      stats.close < stats.ema9 &&
+      stats.ema9 < stats.ema21 &&
+      stats.rsi <= 48 &&
+      stats.macdHist < 8;
 
     if (!bearishAgreement && !weakBearishMomentum) {
       effectiveSignal = "No Trade";
-      reasons.push(`Bearish setup failed V2 agreement filter.`);
+      reasons.push("Bearish setup failed V2 agreement filter.");
     }
 
-    if (rsi < 28) {
+    if (stats.rsi < 28) {
       effectiveSignal = "No Trade";
-      reasons.push(`RSI is oversold below 28; avoiding bearish chase.`);
+      reasons.push("RSI oversold below 28.");
     }
   }
 
-  if (effectiveSignal !== "No Trade" && signal.confidence < 75) {
+  if (effectiveSignal !== "No Trade" && signal.confidence < 70) {
     effectiveSignal = "No Trade";
-    reasons.push(`V2 requires at least 75% confidence for tradeable signals.`);
+    reasons.push("V2 requires at least 70% confidence.");
   }
 
   if (effectiveSignal !== "No Trade") {
-    reasons.push(`V2 accepted: trend, momentum, volatility, and confidence filters passed.`);
+    reasons.push("V2 accepted.");
   }
 
-  return {
-    ...signal,
-    effectiveSignal,
-    v2Reasons: reasons
-  };
+  return { ...signal, effectiveSignal, filterReasons: reasons };
+}
+
+function macdPass(mode: V3Config["macdMode"], signalDirection: "bull" | "bear", macdHist: number) {
+  if (mode === "loose") {
+    return signalDirection === "bull" ? macdHist > -10 : macdHist < 10;
+  }
+
+  if (mode === "medium") {
+    return signalDirection === "bull" ? macdHist > 0 : macdHist <= 0;
+  }
+
+  return signalDirection === "bull" ? macdHist > 8 : macdHist < -8;
+}
+
+function applyOptimizerV3(signal: Signal, candles: Candle[], config: V3Config): FilteredSignal {
+  const reasons: string[] = [];
+  const stats = getStats(signal, candles);
+
+  let effectiveSignal: Signal["signal"] | "No Trade" = applyTradeFilter(
+    signal,
+    config.minConfidence
+  );
+
+  if (effectiveSignal === "No Trade") {
+    reasons.push("Below confidence threshold or neutral raw signal.");
+    return { ...signal, effectiveSignal, filterReasons: reasons };
+  }
+
+  if (config.emaSpreadMinPct > 0 && stats.emaSpreadPct < config.emaSpreadMinPct) {
+    effectiveSignal = "No Trade";
+    reasons.push(`EMA 9/21 spread failed ${config.emaSpreadMinPct}%.`);
+  }
+
+  if (
+    config.emaTrendSpreadMinPct > 0 &&
+    stats.emaTrendSpreadPct < config.emaTrendSpreadMinPct
+  ) {
+    effectiveSignal = "No Trade";
+    reasons.push(`EMA 21/50 spread failed ${config.emaTrendSpreadMinPct}%.`);
+  }
+
+  if (config.atrMinPct > 0 && stats.atrPct < config.atrMinPct) {
+    effectiveSignal = "No Trade";
+    reasons.push(`ATR failed ${config.atrMinPct}%.`);
+  }
+
+  if (config.rangeMinPct > 0 && stats.recentRangePct < config.rangeMinPct) {
+    effectiveSignal = "No Trade";
+    reasons.push(`Recent range failed ${config.rangeMinPct}%.`);
+  }
+
+  if (effectiveSignal.includes("Bullish")) {
+    const trendPass = stats.close > stats.ema9 && stats.ema9 > stats.ema21;
+    const rsiPass = stats.rsi >= config.bullishRsiMin && stats.rsi <= 72;
+    const macdOk = macdPass(config.macdMode, "bull", stats.macdHist);
+
+    if (!trendPass) {
+      effectiveSignal = "No Trade";
+      reasons.push("Bullish trend structure failed.");
+    }
+
+    if (!rsiPass) {
+      effectiveSignal = "No Trade";
+      reasons.push(`Bullish RSI failed. RSI ${round(stats.rsi)}.`);
+    }
+
+    if (!macdOk) {
+      effectiveSignal = "No Trade";
+      reasons.push(`Bullish MACD ${config.macdMode} failed.`);
+    }
+  }
+
+  if (effectiveSignal.includes("Bearish")) {
+    const trendPass = stats.close < stats.ema9 && stats.ema9 < stats.ema21;
+    const rsiPass = stats.rsi <= config.bearishRsiMax && stats.rsi >= 28;
+    const macdOk = macdPass(config.macdMode, "bear", stats.macdHist);
+
+    if (!trendPass) {
+      effectiveSignal = "No Trade";
+      reasons.push("Bearish trend structure failed.");
+    }
+
+    if (!rsiPass) {
+      effectiveSignal = "No Trade";
+      reasons.push(`Bearish RSI failed. RSI ${round(stats.rsi)}.`);
+    }
+
+    if (!macdOk) {
+      effectiveSignal = "No Trade";
+      reasons.push(`Bearish MACD ${config.macdMode} failed.`);
+    }
+  }
+
+  if (effectiveSignal !== "No Trade") {
+    reasons.push("V3 accepted.");
+  }
+
+  return { ...signal, effectiveSignal, filterReasons: reasons };
 }
 
 function gradeBacktestSignal(
@@ -202,14 +333,11 @@ function gradeBacktestSignal(
   minUsefulMovePct: number,
   strongMovePct: number,
   effectiveOverride?: Signal["signal"] | "No Trade",
-  v2Reasons?: string[]
+  filterReasons?: string[]
 ): BacktestRow {
-  const effectiveSignal =
-    effectiveOverride ?? applyTradeFilter(signal, minConfidence);
-
+  const effectiveSignal = effectiveOverride ?? applyTradeFilter(signal, minConfidence);
   const move = next.close - signal.close;
   const movePct = signal.close === 0 ? 0 : (move / signal.close) * 100;
-
   const isTradeable = effectiveSignal !== "No Trade";
 
   if (!isTradeable) {
@@ -239,12 +367,11 @@ function gradeBacktestSignal(
       support: signal.support,
       resistance: signal.resistance,
       notes: signal.notes ?? [],
-      v2Reasons
+      filterReasons
     };
   }
 
   const direction = expectedDirection(effectiveSignal);
-
   let directionalScorePct = 0;
 
   if (direction === "up") {
@@ -253,9 +380,7 @@ function gradeBacktestSignal(
     directionalScorePct = -movePct;
   } else {
     directionalScorePct =
-      Math.abs(movePct) <= minUsefulMovePct
-        ? minUsefulMovePct
-        : -Math.abs(movePct);
+      Math.abs(movePct) <= minUsefulMovePct ? minUsefulMovePct : -Math.abs(movePct);
   }
 
   let grade: BacktestGrade = "Flat";
@@ -266,8 +391,7 @@ function gradeBacktestSignal(
   else if (directionalScorePct > -strongMovePct) grade = "Small Loss";
   else grade = "Strong Loss";
 
-  const isCorrect =
-    grade === "Strong Win" || grade === "Small Win" || grade === "Flat";
+  const isCorrect = grade === "Strong Win" || grade === "Small Win" || grade === "Flat";
   const isUsefulWin = grade === "Strong Win" || grade === "Small Win";
   const isUsefulLoss = grade === "Strong Loss" || grade === "Small Loss";
 
@@ -297,7 +421,7 @@ function gradeBacktestSignal(
     support: signal.support,
     resistance: signal.resistance,
     notes: signal.notes ?? [],
-    v2Reasons
+    filterReasons
   };
 }
 
@@ -344,13 +468,7 @@ function summarize(rows: BacktestRow[]): Summary {
 }
 
 function bySignal(rows: BacktestRow[]) {
-  const labels = [
-    "Strong Bullish",
-    "Bullish",
-    "Bearish",
-    "Strong Bearish",
-    "Neutral"
-  ];
+  const labels = ["Strong Bullish", "Bullish", "Bearish", "Strong Bearish", "Neutral"];
 
   return labels.map((signal) => {
     const group = rows.filter((r) => r.signal === signal);
@@ -382,7 +500,7 @@ function thresholdComparison(
           minUsefulMovePct,
           strongMovePct,
           tuned.effectiveSignal,
-          tuned.v2Reasons
+          tuned.filterReasons
         );
       }
 
@@ -434,15 +552,165 @@ function improvement(current: Summary, tuned: Summary) {
     tradeableSignalsDelta: tuned.tradeableSignals - current.tradeableSignals,
     noTradeDelta: tuned.noTradeSignals - current.noTradeSignals,
     usefulAccuracyDelta: tuned.usefulAccuracyPct - current.usefulAccuracyPct,
-    directionalAccuracyDelta:
-      tuned.directionalAccuracyPct - current.directionalAccuracyPct,
-    avgDirectionalEdgeDelta: round(
-      tuned.avgDirectionalEdgePct - current.avgDirectionalEdgePct
-    ),
+    directionalAccuracyDelta: tuned.directionalAccuracyPct - current.directionalAccuracyPct,
+    avgDirectionalEdgeDelta: round(tuned.avgDirectionalEdgePct - current.avgDirectionalEdgePct),
     strongLossDelta: tuned.strongLosses - current.strongLosses,
     usefulWinDelta: tuned.usefulWins - current.usefulWins,
     usefulLossDelta: tuned.usefulLosses - current.usefulLosses
   };
+}
+
+function buildV3Configs(): V3Config[] {
+  const minConfidenceValues = [55, 60, 65, 70, 75, 80, 85];
+  const emaSpreadValues = [0, 0.02, 0.04, 0.06];
+  const emaTrendSpreadValues = [0, 0.03, 0.05];
+  const atrValues = [0, 0.08, 0.1, 0.12];
+  const rangeValues = [0, 0.2, 0.25, 0.3];
+  const bullishRsiValues = [45, 48, 50];
+  const bearishRsiValues = [48, 50, 52, 55];
+  const macdModes: V3Config["macdMode"][] = ["loose", "medium", "strict"];
+
+  const configs: V3Config[] = [];
+
+  for (const minConfidence of minConfidenceValues) {
+    for (const emaSpreadMinPct of emaSpreadValues) {
+      for (const emaTrendSpreadMinPct of emaTrendSpreadValues) {
+        for (const atrMinPct of atrValues) {
+          for (const rangeMinPct of rangeValues) {
+            for (const bullishRsiMin of bullishRsiValues) {
+              for (const bearishRsiMax of bearishRsiValues) {
+                for (const macdMode of macdModes) {
+                  const id = [
+                    `conf${minConfidence}`,
+                    `ema${emaSpreadMinPct}`,
+                    `trend${emaTrendSpreadMinPct}`,
+                    `atr${atrMinPct}`,
+                    `range${rangeMinPct}`,
+                    `brsi${bullishRsiMin}`,
+                    `srsi${bearishRsiMax}`,
+                    `macd${macdMode}`
+                  ].join("_");
+
+                  configs.push({
+                    id,
+                    minConfidence,
+                    emaSpreadMinPct,
+                    emaTrendSpreadMinPct,
+                    atrMinPct,
+                    rangeMinPct,
+                    bullishRsiMin,
+                    bearishRsiMax,
+                    macdMode
+                  });
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return configs;
+}
+
+function scoreOptimizerCandidate(summary: Summary) {
+  if (summary.tradeableSignals < 10) return -9999;
+
+  const edgeScore = summary.avgDirectionalEdgePct * 250;
+  const usefulScore = summary.usefulAccuracyPct * 1.25;
+  const directionalScore = summary.directionalAccuracyPct * 0.25;
+  const strongLossPenalty = summary.strongLosses * 6;
+  const smallLossPenalty = summary.smallLosses * 1.25;
+  const volumeBonus = Math.min(summary.tradeableSignals, 80) * 0.15;
+
+  return round(
+    edgeScore +
+      usefulScore +
+      directionalScore +
+      volumeBonus -
+      strongLossPenalty -
+      smallLossPenalty,
+    3
+  );
+}
+
+function runV3Optimizer(
+  signalPairs: Array<{ signal: Signal; next: Candle; history: Candle[] }>,
+  minUsefulMovePct: number,
+  strongMovePct: number
+) {
+  const configs = buildV3Configs();
+  const results: OptimizerResult[] = [];
+
+  for (const config of configs) {
+    const rows = signalPairs.map(({ signal, next, history }) => {
+      const filtered = applyOptimizerV3(signal, history, config);
+
+      return gradeBacktestSignal(
+        "Optimizer V3",
+        signal,
+        next,
+        config.minConfidence,
+        minUsefulMovePct,
+        strongMovePct,
+        filtered.effectiveSignal,
+        filtered.filterReasons
+      );
+    });
+
+    const summary = summarize(rows);
+    const score = scoreOptimizerCandidate(summary);
+
+    results.push({
+      rank: 0,
+      score,
+      config,
+      summary
+    });
+  }
+
+  const ranked = results
+    .filter((r) => r.score > -9999)
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      if (b.summary.avgDirectionalEdgePct !== a.summary.avgDirectionalEdgePct) {
+        return b.summary.avgDirectionalEdgePct - a.summary.avgDirectionalEdgePct;
+      }
+      if (b.summary.usefulAccuracyPct !== a.summary.usefulAccuracyPct) {
+        return b.summary.usefulAccuracyPct - a.summary.usefulAccuracyPct;
+      }
+      return a.summary.strongLosses - b.summary.strongLosses;
+    })
+    .slice(0, 15)
+    .map((result, index) => ({
+      ...result,
+      rank: index + 1
+    }));
+
+  return ranked;
+}
+
+function rowsForV3Config(
+  signalPairs: Array<{ signal: Signal; next: Candle; history: Candle[] }>,
+  config: V3Config,
+  minUsefulMovePct: number,
+  strongMovePct: number
+) {
+  return signalPairs.map(({ signal, next, history }) => {
+    const filtered = applyOptimizerV3(signal, history, config);
+
+    return gradeBacktestSignal(
+      "Optimizer V3",
+      signal,
+      next,
+      config.minConfidence,
+      minUsefulMovePct,
+      strongMovePct,
+      filtered.effectiveSignal,
+      filtered.filterReasons
+    );
+  });
 }
 
 export async function GET(req: NextRequest) {
@@ -466,10 +734,7 @@ export async function GET(req: NextRequest) {
     const safeLimit = Math.min(Math.max(limit, 80), 2000);
     const safeMinConfidence = Math.min(Math.max(minConfidence, 0), 100);
     const safeMinUsefulMovePct = Math.min(Math.max(minUsefulMovePct, 0.01), 5);
-    const safeStrongMovePct = Math.min(
-      Math.max(strongMovePct, safeMinUsefulMovePct),
-      10
-    );
+    const safeStrongMovePct = Math.min(Math.max(strongMovePct, safeMinUsefulMovePct), 10);
 
     const { data, error } = await supabase
       .from("btc_hourly_candles")
@@ -504,8 +769,7 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    const signalPairs: Array<{ signal: Signal; next: Candle; history: Candle[] }> =
-      [];
+    const signalPairs: Array<{ signal: Signal; next: Candle; history: Candle[] }> = [];
 
     for (let i = 50; i < candles.length - 1; i++) {
       const start = Math.max(0, i - 239);
@@ -540,7 +804,7 @@ export async function GET(req: NextRequest) {
         safeMinUsefulMovePct,
         safeStrongMovePct,
         tuned.effectiveSignal,
-        tuned.v2Reasons
+        tuned.filterReasons
       );
     });
 
@@ -564,6 +828,19 @@ export async function GET(req: NextRequest) {
     const currentBestThreshold = pickBestThreshold(currentThresholdRows);
     const tunedBestThreshold = pickBestThreshold(tunedThresholdRows);
 
+    const optimizerTop = runV3Optimizer(signalPairs, safeMinUsefulMovePct, safeStrongMovePct);
+    const bestV3 = optimizerTop[0] ?? null;
+    const bestV3Rows = bestV3
+      ? rowsForV3Config(
+          signalPairs,
+          bestV3.config,
+          safeMinUsefulMovePct,
+          safeStrongMovePct
+        )
+      : [];
+
+    const bestV3Summary = bestV3Rows.length ? summarize(bestV3Rows) : null;
+
     return NextResponse.json({
       generatedAt: new Date().toISOString(),
       config: {
@@ -572,7 +849,8 @@ export async function GET(req: NextRequest) {
         minUsefulMovePct: safeMinUsefulMovePct,
         strongMovePct: safeStrongMovePct,
         candleCount: candles.length,
-        testedPeriods: currentRows.length
+        testedPeriods: currentRows.length,
+        optimizerConfigsTested: buildV3Configs().length
       },
       current: {
         summary: currentSummary,
@@ -588,7 +866,16 @@ export async function GET(req: NextRequest) {
         bestThreshold: tunedBestThreshold,
         recent: tunedRows.slice().reverse().slice(0, 100)
       },
-      comparison: improvement(currentSummary, tunedSummary)
+      optimizerV3: {
+        topConfigs: optimizerTop,
+        bestConfig: bestV3,
+        bestSummary: bestV3Summary,
+        recent: bestV3Rows.slice().reverse().slice(0, 100)
+      },
+      comparison: improvement(currentSummary, tunedSummary),
+      comparisonV3: bestV3Summary
+        ? improvement(currentSummary, bestV3Summary)
+        : null
     });
   } catch (e) {
     return NextResponse.json(

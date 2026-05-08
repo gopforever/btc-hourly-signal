@@ -24,7 +24,7 @@ type Summary = {
 };
 
 type BacktestRow = {
-  model: "Current Model" | "Tuned Model V2";
+  model: "Current Model" | "Tuned Model V2" | "Optimizer V3";
   candle_ts: string;
   next_ts: string;
   signal: string;
@@ -49,7 +49,7 @@ type BacktestRow = {
   support?: number | null;
   resistance?: number | null;
   notes: string[];
-  v2Reasons?: string[];
+  filterReasons?: string[];
 };
 
 type ModelResult = {
@@ -58,6 +58,25 @@ type ModelResult = {
   thresholdComparison: Array<Summary & { threshold: number }>;
   bestThreshold: (Summary & { threshold: number }) | null;
   recent: BacktestRow[];
+};
+
+type V3Config = {
+  id: string;
+  minConfidence: number;
+  emaSpreadMinPct: number;
+  emaTrendSpreadMinPct: number;
+  atrMinPct: number;
+  rangeMinPct: number;
+  bullishRsiMin: number;
+  bearishRsiMax: number;
+  macdMode: "loose" | "medium" | "strict";
+};
+
+type OptimizerResult = {
+  rank: number;
+  score: number;
+  config: V3Config;
+  summary: Summary;
 };
 
 type BacktestPayload = {
@@ -69,9 +88,16 @@ type BacktestPayload = {
     strongMovePct: number;
     candleCount: number;
     testedPeriods: number;
+    optimizerConfigsTested: number;
   };
   current: ModelResult;
   tunedV2: ModelResult;
+  optimizerV3: {
+    topConfigs: OptimizerResult[];
+    bestConfig: OptimizerResult | null;
+    bestSummary: Summary | null;
+    recent: BacktestRow[];
+  };
   comparison: {
     tradeableSignalsDelta: number;
     noTradeDelta: number;
@@ -82,6 +108,16 @@ type BacktestPayload = {
     usefulWinDelta: number;
     usefulLossDelta: number;
   };
+  comparisonV3: {
+    tradeableSignalsDelta: number;
+    noTradeDelta: number;
+    usefulAccuracyDelta: number;
+    directionalAccuracyDelta: number;
+    avgDirectionalEdgeDelta: number;
+    strongLossDelta: number;
+    usefulWinDelta: number;
+    usefulLossDelta: number;
+  } | null;
 };
 
 const money = (v?: number | null) =>
@@ -96,8 +132,7 @@ const money = (v?: number | null) =>
 const pct = (v?: number | null) =>
   v == null || Number.isNaN(v) ? "—" : `${v >= 0 ? "+" : ""}${v.toFixed(3)}%`;
 
-const signed = (v: number, suffix = "") =>
-  `${v >= 0 ? "+" : ""}${v}${suffix}`;
+const signed = (v: number, suffix = "") => `${v >= 0 ? "+" : ""}${v}${suffix}`;
 
 const timeLabel = (iso: string) =>
   new Date(iso).toLocaleString([], {
@@ -118,12 +153,6 @@ function gradeClass(grade: string) {
   if (grade.includes("Win")) return "badge green";
   if (grade.includes("Loss")) return "badge red";
   if (grade === "No Trade") return "badge yellow";
-  return "badge blue";
-}
-
-function deltaClass(value: number) {
-  if (value > 0) return "badge green";
-  if (value < 0) return "badge red";
   return "badge blue";
 }
 
@@ -221,6 +250,63 @@ function ThresholdTable({
   );
 }
 
+function ConfigText({ config }: { config: V3Config }) {
+  return (
+    <div className="subtle" style={{ lineHeight: 1.45 }}>
+      Conf {config.minConfidence}% · EMA {config.emaSpreadMinPct}% · Trend{" "}
+      {config.emaTrendSpreadMinPct}% · ATR {config.atrMinPct}% · Range{" "}
+      {config.rangeMinPct}% · Bull RSI {config.bullishRsiMin}+ · Bear RSI ≤
+      {config.bearishRsiMax} · MACD {config.macdMode}
+    </div>
+  );
+}
+
+function OptimizerTable({ rows }: { rows: OptimizerResult[] }) {
+  return (
+    <section className="card card-inner" style={{ marginBottom: 16 }}>
+      <div className="metric-title" style={{ marginBottom: 10 }}>
+        Optimizer V3 — Top Configurations
+      </div>
+
+      <table className="table">
+        <thead>
+          <tr>
+            <th>Rank</th>
+            <th>Score</th>
+            <th>Tradeable</th>
+            <th>No Trade</th>
+            <th>Useful</th>
+            <th>Avg Edge</th>
+            <th>Strong Loss</th>
+            <th>Config</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => (
+            <tr key={row.config.id}>
+              <td>#{row.rank}</td>
+              <td>{row.score}</td>
+              <td>{row.summary.tradeableSignals}</td>
+              <td>{row.summary.noTradeSignals}</td>
+              <td>{row.summary.usefulAccuracyPct}%</td>
+              <td>{pct(row.summary.avgDirectionalEdgePct)}</td>
+              <td>{row.summary.strongLosses}</td>
+              <td>
+                <ConfigText config={row.config} />
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      <div className="footer-note">
+        Optimizer score rewards useful accuracy, positive directional edge, and enough tradeable
+        signals while penalizing strong losses and small losses.
+      </div>
+    </section>
+  );
+}
+
 function RecentTable({
   title,
   rows,
@@ -251,7 +337,7 @@ function RecentTable({
             <th>Move</th>
             <th>Edge</th>
             <th>Grade</th>
-            {showReasons ? <th>V2 Reason</th> : null}
+            {showReasons ? <th>Filter Reason</th> : null}
           </tr>
         </thead>
         <tbody>
@@ -273,9 +359,7 @@ function RecentTable({
                 <span className={gradeClass(row.grade)}>{row.grade}</span>
               </td>
               {showReasons ? (
-                <td className="subtle">
-                  {(row.v2Reasons ?? []).slice(0, 2).join(" ")}
-                </td>
+                <td className="subtle">{(row.filterReasons ?? []).slice(0, 2).join(" ")}</td>
               ) : null}
             </tr>
           ))}
@@ -331,18 +415,27 @@ export function BacktestClient() {
   }, []);
 
   const recommendation = useMemo(() => {
-    if (!data?.tunedV2.bestThreshold) return "Collect more resolved candles before tuning.";
+    if (!data) return "Run the optimizer.";
 
     const currentBest = data.current.bestThreshold;
     const tunedBest = data.tunedV2.bestThreshold;
+    const v3Best = data.optimizerV3.bestConfig;
 
     const currentText = currentBest
       ? `Current best: ${currentBest.threshold}% confidence, useful ${currentBest.usefulAccuracyPct}%, edge ${pct(currentBest.avgDirectionalEdgePct)}.`
       : "Current best unavailable.";
 
-    return `${currentText} V2 best: ${tunedBest.threshold}% confidence, useful ${tunedBest.usefulAccuracyPct}%, edge ${pct(
-      tunedBest.avgDirectionalEdgePct
-    )}, tradeable ${tunedBest.tradeableSignals}.`;
+    const tunedText = tunedBest
+      ? ` V2 best: ${tunedBest.threshold}% confidence, useful ${tunedBest.usefulAccuracyPct}%, edge ${pct(tunedBest.avgDirectionalEdgePct)}.`
+      : "";
+
+    const v3Text = v3Best
+      ? ` V3 best: useful ${v3Best.summary.usefulAccuracyPct}%, edge ${pct(
+          v3Best.summary.avgDirectionalEdgePct
+        )}, tradeable ${v3Best.summary.tradeableSignals}, strong losses ${v3Best.summary.strongLosses}.`
+      : "";
+
+    return `${currentText}${tunedText}${v3Text}`;
   }, [data]);
 
   return (
@@ -352,8 +445,8 @@ export function BacktestClient() {
           <div className="subtle">Historical Simulation</div>
           <h1 className="h1">Backtest + Tuning Dashboard</h1>
           <p className="subtle">
-            Compares the current hourly BTC signal engine against Tuned Model V2. V2 uses stricter trend,
-            momentum, volatility, overextension, and no-trade filters.
+            Compares Current Model, Tuned Model V2, and Optimizer V3. V3 runs a grid
+            search across confidence, trend, volatility, RSI, MACD, and no-trade filters.
           </p>
 
           <div
@@ -417,7 +510,7 @@ export function BacktestClient() {
 
           <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 16 }}>
             <button className="button" onClick={load} disabled={loading}>
-              {loading ? "Running Backtest..." : "Run Backtest"}
+              {loading ? "Running Optimizer..." : "Run Backtest + Optimizer"}
             </button>
             <Link className="button" href="/accuracy">
               Accuracy Page
@@ -431,7 +524,7 @@ export function BacktestClient() {
         <div className="card card-inner">
           <div className="metric-title">Recommendation</div>
           <div className="metric-value" style={{ fontSize: 22 }}>
-            Compare V2 before live use
+            Find positive edge first
           </div>
           <p className="subtle">{recommendation}</p>
         </div>
@@ -449,26 +542,53 @@ export function BacktestClient() {
         <>
           <section className="grid grid-4" style={{ marginBottom: 16 }}>
             <MetricCard
-              label="Useful Accuracy Delta"
-              value={signed(data.comparison.usefulAccuracyDelta, "%")}
-              sub="V2 minus Current"
+              label="V3 Useful Accuracy Delta"
+              value={
+                data.comparisonV3
+                  ? signed(data.comparisonV3.usefulAccuracyDelta, "%")
+                  : "—"
+              }
+              sub="V3 minus Current"
             />
             <MetricCard
-              label="Avg Edge Delta"
-              value={pct(data.comparison.avgDirectionalEdgeDelta)}
-              sub="V2 minus Current"
+              label="V3 Avg Edge Delta"
+              value={
+                data.comparisonV3
+                  ? pct(data.comparisonV3.avgDirectionalEdgeDelta)
+                  : "—"
+              }
+              sub="V3 minus Current"
             />
             <MetricCard
-              label="Strong Loss Delta"
-              value={signed(data.comparison.strongLossDelta)}
+              label="V3 Strong Loss Delta"
+              value={
+                data.comparisonV3
+                  ? signed(data.comparisonV3.strongLossDelta)
+                  : "—"
+              }
               sub="Lower is better"
             />
             <MetricCard
-              label="No-Trade Delta"
-              value={signed(data.comparison.noTradeDelta)}
-              sub="Higher means stricter filtering"
+              label="Configs Tested"
+              value={data.config.optimizerConfigsTested}
+              sub="V3 grid search combinations"
             />
           </section>
+
+          {data.optimizerV3.bestConfig && data.optimizerV3.bestSummary ? (
+            <>
+              <section className="card card-inner" style={{ marginBottom: 16 }}>
+                <div className="metric-title">Best V3 Config</div>
+                <div className="metric-value" style={{ fontSize: 24 }}>
+                  Rank #{data.optimizerV3.bestConfig.rank} · Score{" "}
+                  {data.optimizerV3.bestConfig.score}
+                </div>
+                <ConfigText config={data.optimizerV3.bestConfig.config} />
+              </section>
+
+              <SummaryGrid summary={data.optimizerV3.bestSummary} title="Optimizer V3 Best Config" />
+            </>
+          ) : null}
 
           <SummaryGrid summary={data.current.summary} title="Current Model" />
           <SummaryGrid summary={data.tunedV2.summary} title="Tuned Model V2" />
@@ -490,11 +610,13 @@ export function BacktestClient() {
               sub={`${data.tunedV2.summary.smallLosses} small losses`}
             />
             <MetricCard
-              label="V2 Flat / Noise"
-              value={data.tunedV2.summary.flat}
-              sub={`Move under ±${data.config.minUsefulMovePct}%`}
+              label="V3 Strong Losses"
+              value={data.optimizerV3.bestSummary?.strongLosses ?? "—"}
+              sub={`${data.optimizerV3.bestSummary?.smallLosses ?? "—"} small losses`}
             />
           </section>
+
+          <OptimizerTable rows={data.optimizerV3.topConfigs} />
 
           <section className="grid grid-2" style={{ marginBottom: 16 }}>
             <ThresholdTable
@@ -568,6 +690,12 @@ export function BacktestClient() {
           </section>
 
           <RecentTable
+            title="Recent Optimizer V3 Best Config Signals"
+            rows={data.optimizerV3.recent}
+            showReasons
+          />
+
+          <RecentTable
             title="Recent Tuned Model V2 Backtested Signals"
             rows={data.tunedV2.recent}
             showReasons
@@ -579,8 +707,8 @@ export function BacktestClient() {
           />
 
           <div className="footer-note">
-            V2 is backtest-only right now. Do not wire it into the live signal engine until it shows a durable
-            improvement over more candles.
+            V3 is optimizer/backtest-only. Do not wire it into the live signal engine until it
+            shows a durable positive edge over more candles.
           </div>
         </>
       )}
