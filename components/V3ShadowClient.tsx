@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 
 type Summary = {
@@ -26,6 +26,8 @@ type Summary = {
 type V3Row = {
   id: number;
   candle_ts: string;
+  variant_key: string;
+  variant_name: string;
   raw_signal: string;
   effective_signal: string;
   is_tradeable: boolean;
@@ -50,6 +52,21 @@ type V3Row = {
   created_at: string;
 };
 
+type VariantGroup = {
+  rank: number;
+  variantKey: string;
+  variantName: string;
+  config: any;
+  latest: V3Row | null;
+  summary: {
+    all: Summary;
+    last24h: Summary;
+    last7d: Summary;
+    last30d: Summary;
+  };
+  recent: V3Row[];
+};
+
 type Payload = {
   generatedAt: string;
   summary: {
@@ -58,7 +75,12 @@ type Payload = {
     last7d: Summary;
     last30d: Summary;
   };
-  latest: V3Row | null;
+  variants: {
+    all: VariantGroup[];
+    last24h: VariantGroup[];
+    last7d: VariantGroup[];
+    last30d: VariantGroup[];
+  };
   recent: V3Row[];
 };
 
@@ -141,9 +163,23 @@ function SummaryGrid({ summary }: { summary: Summary }) {
   );
 }
 
+function ConfigText({ config }: { config: any }) {
+  if (!config) return <span className="subtle">—</span>;
+
+  return (
+    <span className="subtle">
+      Conf {config.minConfidence}% · EMA {config.emaSpreadMinPct}% · Bull RSI{" "}
+      {config.bullishRsiMin}+ · Bear RSI ≤{config.bearishRsiMax} · MACD{" "}
+      {config.macdMode}
+    </span>
+  );
+}
+
 export function V3ShadowClient() {
   const [data, setData] = useState<Payload | null>(null);
-  const [windowKey, setWindowKey] = useState<"all" | "last24h" | "last7d" | "last30d">("all");
+  const [windowKey, setWindowKey] =
+    useState<"all" | "last24h" | "last7d" | "last30d">("all");
+  const [selectedVariant, setSelectedVariant] = useState<string>("all");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -152,20 +188,20 @@ export function V3ShadowClient() {
       setLoading(true);
       setError(null);
 
-      const res = await fetch("/api/v3-shadow/accuracy", {
+      const res = await fetch("/api/v3-shadow/variants", {
         cache: "no-store"
       });
 
       const payload = await res.json();
 
       if (!res.ok) {
-        throw new Error(payload?.error ?? `V3 shadow API failed: ${res.status}`);
+        throw new Error(payload?.error ?? `V3 variant API failed: ${res.status}`);
       }
 
       setData(payload);
     } catch (e) {
-      console.error("V3 shadow load failed:", e);
-      setError(e instanceof Error ? e.message : "Unknown V3 shadow error");
+      console.error("V3 variants load failed:", e);
+      setError(e instanceof Error ? e.message : "Unknown V3 variant error");
     } finally {
       setLoading(false);
     }
@@ -175,27 +211,38 @@ export function V3ShadowClient() {
     load();
   }, []);
 
-  const selected = data?.summary[windowKey];
+  const variants = data?.variants[windowKey] ?? [];
+  const selectedSummary = data?.summary[windowKey];
+
+  const bestVariant = variants[0] ?? null;
+
+  const tableRows = useMemo(() => {
+    if (!data) return [];
+
+    if (selectedVariant === "all") {
+      return data.recent;
+    }
+
+    return data.recent.filter((row) => row.variant_key === selectedVariant);
+  }, [data, selectedVariant]);
 
   if (error) {
-    return <section className="card card-inner">Error loading V3 shadow page: {error}</section>;
+    return <section className="card card-inner">Error loading V3 variants page: {error}</section>;
   }
 
-  if (!data || !selected) {
-    return <section className="card card-inner">Loading V3 shadow data...</section>;
+  if (!data || !selectedSummary) {
+    return <section className="card card-inner">Loading V3 variant data...</section>;
   }
-
-  const latest = data.latest;
 
   return (
     <>
       <section className="hero">
         <div className="card card-inner">
           <div className="subtle">Forward Validation</div>
-          <h1 className="h1">V3 Shadow Mode</h1>
+          <h1 className="h1">V3 Shadow Variants</h1>
           <p className="subtle">
-            V3 is being tracked separately from the live model. This page measures future,
-            unseen performance so we do not trust an overfit backtest.
+            Tracks multiple V3 confidence variants forward in time so we can prove which
+            threshold is best before trusting it.
           </p>
 
           <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 16 }}>
@@ -212,63 +259,128 @@ export function V3ShadowClient() {
         </div>
 
         <div className="card card-inner">
-          <div className="metric-title">Latest V3 Candidate</div>
-          {latest ? (
+          <div className="metric-title">Best Forward Variant</div>
+          {bestVariant ? (
             <>
-              <div style={{ margin: "10px 0" }}>
-                <span className={badgeClass(latest.effective_signal)}>
-                  {latest.effective_signal}
-                </span>
+              <div className="metric-value" style={{ fontSize: 26 }}>
+                #{bestVariant.rank} {bestVariant.variantName}
               </div>
-              <div className="metric-value">{latest.confidence}% confidence</div>
               <p className="subtle">
-                Raw: {latest.raw_signal} · Close: {money(latest.close)} · Result:{" "}
-                {latest.result}
+                Useful {bestVariant.summary[windowKey].usefulAccuracyPct}% · Edge{" "}
+                {pct(bestVariant.summary[windowKey].avgDirectionalEdgePct)} · Tradeable{" "}
+                {bestVariant.summary[windowKey].tradeable} · Strong Losses{" "}
+                {bestVariant.summary[windowKey].strongLosses}
               </p>
+              <ConfigText config={bestVariant.config} />
             </>
           ) : (
-            <p className="subtle">No V3 shadow signals yet. Run hourly ingest once.</p>
+            <p className="subtle">No variant data yet. Run hourly ingest once.</p>
           )}
         </div>
       </section>
 
-      <SummaryGrid summary={selected} />
+      <SummaryGrid summary={selectedSummary} />
 
       <section className="grid grid-4" style={{ marginBottom: 16 }}>
         <MetricCard
           label="Resolved"
-          value={selected.resolved}
-          sub={`${selected.pending} pending`}
+          value={selectedSummary.resolved}
+          sub={`${selectedSummary.pending} pending`}
         />
         <MetricCard
           label="Tradeable"
-          value={selected.tradeable}
-          sub={`${selected.noTrade} no-trade filtered`}
+          value={selectedSummary.tradeable}
+          sub={`${selectedSummary.noTrade} no-trade filtered`}
         />
         <MetricCard
           label="Strong Wins"
-          value={selected.strongWins}
-          sub={`${selected.smallWins} small wins`}
+          value={selectedSummary.strongWins}
+          sub={`${selectedSummary.smallWins} small wins`}
         />
         <MetricCard
           label="Flat / Noise"
-          value={selected.flat}
+          value={selectedSummary.flat}
           sub="Tradeable but below useful move threshold"
         />
+      </section>
+
+      <section className="card card-inner" style={{ marginBottom: 16 }}>
+        <div className="metric-title" style={{ marginBottom: 10 }}>
+          Forward Accuracy by Variant
+        </div>
+
+        <table className="table">
+          <thead>
+            <tr>
+              <th>Rank</th>
+              <th>Variant</th>
+              <th>Config</th>
+              <th>Resolved</th>
+              <th>Tradeable</th>
+              <th>No Trade</th>
+              <th>Useful</th>
+              <th>Directional</th>
+              <th>Avg Edge</th>
+              <th>Strong Loss</th>
+            </tr>
+          </thead>
+          <tbody>
+            {variants.map((variant) => {
+              const s = variant.summary[windowKey];
+
+              return (
+                <tr key={variant.variantKey}>
+                  <td>#{variant.rank}</td>
+                  <td>
+                    <button
+                      className="button"
+                      onClick={() => setSelectedVariant(variant.variantKey)}
+                    >
+                      {variant.variantName}
+                    </button>
+                  </td>
+                  <td>
+                    <ConfigText config={variant.config} />
+                  </td>
+                  <td>{s.resolved}</td>
+                  <td>{s.tradeable}</td>
+                  <td>{s.noTrade}</td>
+                  <td>{s.usefulAccuracyPct}%</td>
+                  <td>{s.directionalAccuracyPct}%</td>
+                  <td>{pct(s.avgDirectionalEdgePct)}</td>
+                  <td>{s.strongLosses}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+
+        <div className="footer-note">
+          Click a variant name to filter the recent signal table below.
+        </div>
       </section>
 
       <section className="card card-inner">
         <div style={{ display: "flex", justifyContent: "space-between", gap: 16, marginBottom: 12 }}>
           <div>
-            <div className="metric-title">Recent V3 Shadow Signals</div>
-            <div className="metric-value">Last {data.recent.length}</div>
+            <div className="metric-title">Recent V3 Variant Signals</div>
+            <div className="metric-value">
+              {selectedVariant === "all" ? "All Variants" : selectedVariant}
+            </div>
           </div>
+
+          {selectedVariant !== "all" ? (
+            <button className="button" onClick={() => setSelectedVariant("all")}>
+              Show All
+            </button>
+          ) : null}
         </div>
 
         <table className="table">
           <thead>
             <tr>
               <th>Hour</th>
+              <th>Variant</th>
               <th>Raw</th>
               <th>V3 Effective</th>
               <th>Conf</th>
@@ -282,9 +394,10 @@ export function V3ShadowClient() {
             </tr>
           </thead>
           <tbody>
-            {data.recent.slice(0, 80).map((row) => (
-              <tr key={row.id}>
+            {tableRows.slice(0, 120).map((row) => (
+              <tr key={`${row.id}-${row.variant_key}`}>
                 <td>{timeLabel(row.candle_ts)}</td>
+                <td>{row.variant_name}</td>
                 <td>
                   <span className={badgeClass(row.raw_signal)}>{row.raw_signal}</span>
                 </td>
@@ -313,8 +426,8 @@ export function V3ShadowClient() {
         </table>
 
         <div className="footer-note">
-          V3 Shadow Mode is forward validation only. Do not use it for Robinhood or trade automation
-          until it has a larger sample of resolved future signals.
+          V3 variants are forward-validation only. Do not use them for Robinhood or trade
+          automation until a larger sample proves positive edge.
         </div>
       </section>
     </>

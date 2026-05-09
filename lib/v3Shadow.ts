@@ -18,7 +18,7 @@ export type V3ShadowGrade =
   | "Pending";
 
 export type V3ShadowConfig = {
-  version: "V3_SHADOW_001";
+  version: string;
   minConfidence: number;
   emaSpreadMinPct: number;
   emaTrendSpreadMinPct: number;
@@ -29,6 +29,11 @@ export type V3ShadowConfig = {
   macdMode: "loose" | "medium" | "strict";
   minUsefulMovePct: number;
   strongMovePct: number;
+};
+
+export type V3VariantConfig = V3ShadowConfig & {
+  variantKey: string;
+  variantName: string;
 };
 
 export type V3ShadowSignal = {
@@ -56,10 +61,14 @@ export type V3ShadowSignal = {
   reasons: string[];
 };
 
+export type V3VariantShadowSignal = V3ShadowSignal & {
+  variant_key: string;
+  variant_name: string;
+  config: V3VariantConfig;
+};
+
 export const V3_SHADOW_CONFIG: V3ShadowConfig = {
   version: "V3_SHADOW_001",
-
-  // Best optimizer candidate from your current data:
   minConfidence: 85,
   emaSpreadMinPct: 0.02,
   emaTrendSpreadMinPct: 0,
@@ -68,11 +77,40 @@ export const V3_SHADOW_CONFIG: V3ShadowConfig = {
   bullishRsiMin: 45,
   bearishRsiMax: 48,
   macdMode: "loose",
-
-  // Grading thresholds:
   minUsefulMovePct: 0.1,
   strongMovePct: 0.4
 };
+
+export const V3_SHADOW_VARIANTS: V3VariantConfig[] = [
+  {
+    ...V3_SHADOW_CONFIG,
+    version: "V3_VARIANT_STRICT_85",
+    variantKey: "strict_85",
+    variantName: "Strict 85",
+    minConfidence: 85
+  },
+  {
+    ...V3_SHADOW_CONFIG,
+    version: "V3_VARIANT_BALANCED_80",
+    variantKey: "balanced_80",
+    variantName: "Balanced 80",
+    minConfidence: 80
+  },
+  {
+    ...V3_SHADOW_CONFIG,
+    version: "V3_VARIANT_ACTIVE_75",
+    variantKey: "active_75",
+    variantName: "Active 75",
+    minConfidence: 75
+  },
+  {
+    ...V3_SHADOW_CONFIG,
+    version: "V3_VARIANT_LOOSE_70",
+    variantKey: "loose_70",
+    variantName: "Loose 70",
+    minConfidence: 70
+  }
+];
 
 const round = (value: number | null | undefined, digits = 3) =>
   value == null || Number.isNaN(value) ? null : Number(value.toFixed(digits));
@@ -271,6 +309,23 @@ export function generateV3ShadowSignal(
     config,
     reasons
   };
+}
+
+export function generateV3ShadowVariants(
+  currentSignal: Signal,
+  candles: Candle[],
+  variants: V3VariantConfig[] = V3_SHADOW_VARIANTS
+): V3VariantShadowSignal[] {
+  return variants.map((variant) => {
+    const signal = generateV3ShadowSignal(currentSignal, candles, variant);
+
+    return {
+      ...signal,
+      variant_key: variant.variantKey,
+      variant_name: variant.variantName,
+      config: variant
+    };
+  });
 }
 
 function expectedDirection(signal: string): "up" | "down" | "flat" | "none" {

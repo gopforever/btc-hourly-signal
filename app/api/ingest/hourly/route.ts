@@ -4,9 +4,11 @@ import { fetchCoinbaseHourlyCandles } from "@/lib/marketData";
 import { generateSignal, scorePriorSignal } from "@/lib/indicators";
 import {
   generateV3ShadowSignal,
+  generateV3ShadowVariants,
   scoreV3ShadowSignal,
   V3_SHADOW_CONFIG,
-  type V3ShadowSignal
+  type V3ShadowSignal,
+  type V3VariantShadowSignal
 } from "@/lib/v3Shadow";
 import type { Candle, Signal } from "@/lib/types";
 
@@ -85,6 +87,35 @@ function toV3Row(v3: V3ShadowSignal) {
   };
 }
 
+function toV3VariantRow(v3: V3VariantShadowSignal) {
+  return {
+    candle_ts: v3.candle_ts,
+    variant_key: v3.variant_key,
+    variant_name: v3.variant_name,
+    raw_signal: v3.raw_signal,
+    effective_signal: v3.effective_signal,
+    is_tradeable: v3.is_tradeable,
+    confidence: v3.confidence,
+    close: v3.close,
+    next_close: v3.next_close ?? null,
+    result: v3.result,
+    grade: v3.grade,
+    move: v3.move ?? null,
+    move_pct: v3.move_pct ?? null,
+    directional_score_pct: v3.directional_score_pct ?? null,
+    rsi: v3.rsi ?? null,
+    ema_9: v3.ema_9 ?? null,
+    ema_21: v3.ema_21 ?? null,
+    ema_50: v3.ema_50 ?? null,
+    macd_histogram: v3.macd_histogram ?? null,
+    atr: v3.atr ?? null,
+    support: v3.support ?? null,
+    resistance: v3.resistance ?? null,
+    config: v3.config,
+    reasons: v3.reasons
+  };
+}
+
 export async function GET(req: NextRequest) {
   if (!authorized(req)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -137,11 +168,11 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({
       insertedCandles: rows.length,
       signal: null,
-      v3Shadow: null
+      v3Shadow: null,
+      v3Variants: []
     });
   }
 
-  // Update pending current-model signals.
   const { data: pendingRows } = await supabase
     .from("btc_hourly_signals")
     .select("*")
@@ -177,7 +208,6 @@ export async function GET(req: NextRequest) {
 
   await Promise.all(currentUpdates);
 
-  // Update pending V3 shadow signals.
   const { data: pendingV3Rows } = await supabase
     .from("btc_v3_shadow_signals")
     .select("*")
@@ -214,7 +244,43 @@ export async function GET(req: NextRequest) {
 
   await Promise.all(v3Updates);
 
-  // Upsert latest current-model signal.
+  const { data: pendingVariantRows } = await supabase
+    .from("btc_v3_shadow_variant_signals")
+    .select("*")
+    .eq("result", "Pending")
+    .order("candle_ts", { ascending: true })
+    .limit(400);
+
+  const variantUpdates = [];
+
+  for (const pending of pendingVariantRows ?? []) {
+    const next = candles.find(
+      (c) => new Date(c.ts).getTime() > new Date(pending.candle_ts).getTime()
+    );
+
+    if (!next) continue;
+
+    const scored = scoreV3ShadowSignal(
+      {
+        effective_signal: pending.effective_signal,
+        is_tradeable: Boolean(pending.is_tradeable),
+        close: Number(pending.close),
+        config: pending.config ?? V3_SHADOW_CONFIG
+      },
+      next.close
+    );
+
+    variantUpdates.push(
+      supabase
+        .from("btc_v3_shadow_variant_signals")
+        .update(scored)
+        .eq("candle_ts", pending.candle_ts)
+        .eq("variant_key", pending.variant_key)
+    );
+  }
+
+  await Promise.all(variantUpdates);
+
   const { error: signalError } = await supabase
     .from("btc_hourly_signals")
     .upsert(toSignalRow(signal), { onConflict: "candle_ts" });
@@ -223,7 +289,6 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: signalError.message }, { status: 500 });
   }
 
-  // Generate and upsert latest V3 shadow candidate.
   const v3Shadow = generateV3ShadowSignal(signal, candles);
 
   const { error: v3Error } = await supabase
@@ -234,11 +299,25 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: v3Error.message }, { status: 500 });
   }
 
+  const v3Variants = generateV3ShadowVariants(signal, candles);
+
+  const { error: variantError } = await supabase
+    .from("btc_v3_shadow_variant_signals")
+    .upsert(v3Variants.map(toV3VariantRow), {
+      onConflict: "candle_ts,variant_key"
+    });
+
+  if (variantError) {
+    return NextResponse.json({ error: variantError.message }, { status: 500 });
+  }
+
   return NextResponse.json({
     insertedCandles: rows.length,
     updatedPendingSignals: currentUpdates.length,
     updatedPendingV3ShadowSignals: v3Updates.length,
+    updatedPendingV3VariantSignals: variantUpdates.length,
     signal,
-    v3Shadow
+    v3Shadow,
+    v3Variants
   });
 }
